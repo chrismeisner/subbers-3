@@ -1,16 +1,14 @@
-// File: lib/getZoomClient.ts
-
-import axios, { AxiosInstance } from 'axios'
 import base from './airtable'
 import { cookies } from 'next/headers'
 
-/**
- * Creates and returns an Axios instance configured with the
- * authenticated user's Zoom access token, refreshing it if needed.
- */
-export async function getZoomClient(): Promise<AxiosInstance> {
-  // 1) Read the logged-in user's email from our HttpOnly cookie
-  const cookieStore = await cookies()
+export interface ZoomClient {
+  get(path: string): Promise<any>
+  post(path: string, body: any): Promise<any>
+}
+
+export async function getZoomClient(): Promise<ZoomClient> {
+  // 1) Read userEmail from HttpOnly cookie
+  const cookieStore = cookies()
   const userEmail = cookieStore.get('userEmail')?.value
   if (!userEmail) {
 	throw new Error('Not authenticated')
@@ -23,63 +21,80 @@ export async function getZoomClient(): Promise<AxiosInstance> {
 	  maxRecords: 1,
 	})
 	.firstPage()
+
   if (records.length === 0) {
 	throw new Error('User record not found')
   }
+
   const userRec = records[0]
   const fields = userRec.fields as any
-  const accessToken: string | undefined = fields.zoomAccessToken
-  const refreshToken: string | undefined = fields.zoomRefreshToken
-  const expiresAt: string | undefined = fields.zoomTokenExpires
+  let accessToken: string | undefined = fields.zoomAccessToken
+  let refreshToken: string | undefined = fields.zoomRefreshToken
+  let expiresAt: string | undefined = fields.zoomTokenExpires
 
   if (!accessToken || !refreshToken || !expiresAt) {
 	throw new Error('Zoom not connected')
   }
 
-  let tokenToUse = accessToken
-  let newRefreshToken = refreshToken
-  let newExpiresAt = expiresAt
-
-  // 3) If the access token has expired, refresh it
+  // 3) Refresh if expired
   if (new Date(expiresAt).getTime() < Date.now()) {
-	const params = new URLSearchParams({
-	  grant_type: 'refresh_token',
-	  refresh_token: refreshToken,
+	const authHeader = Buffer.from(
+	  `${process.env.ZOOM_CLIENT_ID}:${process.env.ZOOM_CLIENT_SECRET}`
+	).toString('base64')
+	const tokenUrl =
+	  `https://zoom.us/oauth/token?grant_type=refresh_token&refresh_token=${encodeURIComponent(
+		refreshToken
+	  )}`
+	const res = await fetch(tokenUrl, {
+	  method: 'POST',
+	  headers: { Authorization: `Basic ${authHeader}` },
 	})
-	const resp = await axios.post(
-	  `https://zoom.us/oauth/token?${params.toString()}`,
-	  null,
-	  {
-		auth: {
-		  username: process.env.ZOOM_CLIENT_ID!,
-		  password: process.env.ZOOM_CLIENT_SECRET!,
-		},
-	  }
-	)
-	const data = resp.data
-	tokenToUse = data.access_token
-	newRefreshToken = data.refresh_token
-	// expires_in is in seconds
-	newExpiresAt = new Date(Date.now() + data.expires_in * 1000).toISOString()
+	if (!res.ok) {
+	  throw new Error('Failed to refresh Zoom token')
+	}
+	const data = await res.json()
+	accessToken = data.access_token
+	refreshToken = data.refresh_token
+	expiresAt = new Date(Date.now() + data.expires_in * 1000).toISOString()
 
-	// Persist the refreshed tokens back to Airtable
+	// Persist refreshed tokens back to Airtable
 	await base('users').update([
 	  {
 		id: userRec.id,
 		fields: {
-		  zoomAccessToken: tokenToUse,
-		  zoomRefreshToken: newRefreshToken,
-		  zoomTokenExpires: newExpiresAt,
+		  zoomAccessToken: accessToken,
+		  zoomRefreshToken: refreshToken,
+		  zoomTokenExpires: expiresAt,
 		},
 	  },
 	])
   }
 
-  // 4) Return an Axios instance pre-configured for Zoom API calls
-  return axios.create({
-	baseURL: 'https://api.zoom.us/v2',
-	headers: {
-	  Authorization: `Bearer ${tokenToUse}`,
+  // 4) Return simple fetch-based wrapper
+  return {
+	get: async (path: string) => {
+	  const resp = await fetch(`https://api.zoom.us/v2${path}`, {
+		headers: { Authorization: `Bearer ${accessToken}` },
+	  })
+	  if (!resp.ok) {
+		throw new Error(`Zoom GET ${path} failed: ${resp.status}`)
+	  }
+	  return resp.json()
 	},
-  })
+
+	post: async (path: string, body: any) => {
+	  const resp = await fetch(`https://api.zoom.us/v2${path}`, {
+		method: 'POST',
+		headers: {
+		  Authorization: `Bearer ${accessToken}`,
+		  'Content-Type': 'application/json',
+		},
+		body: JSON.stringify(body),
+	  })
+	  if (!resp.ok) {
+		throw new Error(`Zoom POST ${path} failed: ${resp.status}`)
+	  }
+	  return resp.json()
+	},
+  }
 }
